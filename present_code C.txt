@@ -1,0 +1,180 @@
+#include <stdio.h>
+#include "platform.h"
+#include "xil_printf.h"
+#include "xil_io.h"
+#include "xparameters.h"
+#include "xuartlite.h"
+#include "present_encrypt_ip.h"
+#include "present_decrypt_ip.h"
+#include "dm_present_ip.h"
+
+// Địa chỉ base của các IP
+#define ENC_BASEADDR  XPAR_PRESENT_ENCRYPT_IP_0_S_AXI_BASEADDR
+#define DEC_BASEADDR  XPAR_PRESENT_DECRYPT_IP_0_S00_AXI_BASEADDR
+#define DM_BASEADDR   XPAR_DM_PRESENT_IP_0_S_AXI_BASEADDR
+
+#define UART_DEVICE_ID XPAR_AXI_UARTLITE_0_DEVICE_ID
+
+XUartLite uart;
+XUartLite_Config *uart_config;
+
+void uart_init() {
+    uart_config = XUartLite_LookupConfig(UART_DEVICE_ID);
+    int status = XUartLite_CfgInitialize(&uart, uart_config, uart_config->RegBaseAddr);
+    if (status != XST_SUCCESS) {
+        xil_printf("UART INIT FAILED\r\n");
+        while (1);
+    }
+    xil_printf("UART INIT SUCCESSFUL\r\n");
+}
+
+void uart_receive_line(char *buffer, int max_length) {
+    int idx = 0;
+    u8 byte;
+    while (idx < max_length - 1) {
+        if (XUartLite_Recv(&uart, &byte, 1) == 1) {
+            if (byte == '\r') {
+                buffer[idx] = '\0';
+                xil_printf("\r\n");
+                return;
+            }
+            buffer[idx++] = byte;
+            xil_printf("%c", byte);
+        }
+    }
+    buffer[idx] = '\0';
+}
+
+u64 hexstr_to_u64(char *hex) {
+    u64 val = 0;
+    sscanf(hex, "%llx", &val);
+    return val;
+}
+
+void wait_done(u32 baseaddr, u32 bit_mask) {
+    u32 reg6;
+    do {
+        reg6 = Xil_In32(baseaddr + 0x18); // reg6
+    } while ((reg6 & bit_mask) == 0);    // chờ bit DONE = 1
+}
+
+void reset_load(u32 baseaddr) {
+    Xil_Out32(baseaddr + 0x18, 0x0); // reset load = 0
+}
+
+void encrypt(u64 plaintext, u64 key_high, u64 key_low) {
+    u32 pt_low  = (u32)(plaintext & 0xFFFFFFFF);
+    u32 pt_high = (u32)(plaintext >> 32);
+    u32 k0 = (u32)(key_low & 0xFFFFFFFF);
+    u32 k1 = (u32)(key_low >> 32);
+    u32 k2 = (u32)(key_high & 0xFFFFFFFF);
+    u32 k3 = (u32)(key_high >> 32);
+
+    Xil_Out32(ENC_BASEADDR + 0x00, pt_low);
+    Xil_Out32(ENC_BASEADDR + 0x04, pt_high);
+    Xil_Out32(ENC_BASEADDR + 0x08, k0);
+    Xil_Out32(ENC_BASEADDR + 0x0C, k1);
+    Xil_Out32(ENC_BASEADDR + 0x10, k2);
+    Xil_Out32(ENC_BASEADDR + 0x14, k3);
+
+    for (volatile int i = 0; i < 1000; i++);
+    Xil_Out32(ENC_BASEADDR + 0x18, 0x1); // load = 1
+    wait_done(ENC_BASEADDR, 0x2);        // bit 1 = load_encrypt
+    reset_load(ENC_BASEADDR);
+
+    u32 ct_low  = Xil_In32(ENC_BASEADDR + 0x1C);
+    u32 ct_high = Xil_In32(ENC_BASEADDR + 0x20);
+    xil_printf("Ciphertext: %08X%08X\r\n", ct_high, ct_low);
+}
+
+void decrypt(u64 ciphertext, u64 key_high, u64 key_low) {
+    u32 ct_low  = (u32)(ciphertext & 0xFFFFFFFF);
+    u32 ct_high = (u32)(ciphertext >> 32);
+    u32 k0 = (u32)(key_low & 0xFFFFFFFF);
+    u32 k1 = (u32)(key_low >> 32);
+    u32 k2 = (u32)(key_high & 0xFFFFFFFF);
+    u32 k3 = (u32)(key_high >> 32);
+
+    Xil_Out32(DEC_BASEADDR + 0x00, ct_low);
+    Xil_Out32(DEC_BASEADDR + 0x04, ct_high);
+    Xil_Out32(DEC_BASEADDR + 0x08, k0);
+    Xil_Out32(DEC_BASEADDR + 0x0C, k1);
+    Xil_Out32(DEC_BASEADDR + 0x10, k2);
+    Xil_Out32(DEC_BASEADDR + 0x14, k3);
+
+    for (volatile int i = 0; i < 1000; i++);
+    Xil_Out32(DEC_BASEADDR + 0x18, 0x1); // load = 1
+
+    // Debug reg6 trước khi wait
+    u32 reg6 = Xil_In32(DEC_BASEADDR + 0x18);
+   // xil_printf("reg6 sau khi load = 1: 0x%08X\r\n", reg6);
+
+    wait_done(DEC_BASEADDR, 0x2);        // chờ bit 1 = load_decrypt
+    reset_load(DEC_BASEADDR);
+
+    u32 pt_low  = Xil_In32(DEC_BASEADDR + 0x1C);
+    u32 pt_high = Xil_In32(DEC_BASEADDR + 0x20);
+    xil_printf("Plaintext: %08X%08X\r\n", pt_high, pt_low);
+}
+
+void hash(u64 plaintext, u64 key_high, u64 key_low) {
+    u32 pt_low  = (u32)(plaintext & 0xFFFFFFFF);
+    u32 pt_high = (u32)(plaintext >> 32);
+    u32 k0 = (u32)(key_low & 0xFFFFFFFF);
+    u32 k1 = (u32)(key_low >> 32);
+    u32 k2 = (u32)(key_high & 0xFFFFFFFF);
+    u32 k3 = (u32)(key_high >> 32);
+
+    Xil_Out32(DM_BASEADDR + 0x00, pt_low);
+    Xil_Out32(DM_BASEADDR + 0x04, pt_high);
+    Xil_Out32(DM_BASEADDR + 0x08, k0);
+    Xil_Out32(DM_BASEADDR + 0x0C, k1);
+    Xil_Out32(DM_BASEADDR + 0x10, k2);
+    Xil_Out32(DM_BASEADDR + 0x14, k3);
+
+    for (volatile int i = 0; i < 1000; i++);
+    Xil_Out32(DM_BASEADDR + 0x18, 0x1); // load = 1
+    wait_done(DM_BASEADDR, 0x2);        // bit 1 = done
+    reset_load(DM_BASEADDR);
+
+    u32 hash_low  = Xil_In32(DM_BASEADDR + 0x1C);
+    u32 hash_high = Xil_In32(DM_BASEADDR + 0x20);
+    xil_printf("Hash: %08X%08X\r\n", hash_high, hash_low);
+}
+
+int main() {
+    init_platform();
+    uart_init();
+
+    xil_printf("=== PRESENT DEMO: Encrypt / Decrypt / Hash ===\r\n");
+
+    char buffer[40];
+    u64 data, key_high, key_low;
+    int mode;
+
+    while (1) {
+        xil_printf("Chon che do: 1 = Ma hoa, 2 = Giai ma, 3 = Hash: ");
+        uart_receive_line(buffer, sizeof(buffer));
+        mode = atoi(buffer);
+
+        xil_printf("Nhap du lieu 64-bit HEX (plaintext hoac ciphertext): ");
+        uart_receive_line(buffer, sizeof(buffer));
+        data = hexstr_to_u64(buffer);
+
+        xil_printf("Nhap key 128-bit HEX: ");
+        uart_receive_line(buffer, sizeof(buffer));
+        sscanf(buffer, "%16llx%16llx", &key_high, &key_low);
+
+        switch (mode) {
+            case 1: encrypt(data, key_high, key_low); break;
+            case 2: decrypt(data, key_high, key_low); break;
+            case 3: hash(data, key_high, key_low); break;
+            default: xil_printf("Khong hop le. Chon 1/2/3.\r\n");
+        }
+
+        xil_printf("\r\n");
+    }
+
+    cleanup_platform();
+    return 0;
+}
